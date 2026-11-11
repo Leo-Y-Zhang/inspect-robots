@@ -40,7 +40,13 @@ from inspect_robots._setup import (
     _valid_max_steps,
     run_setup,
 )
-from inspect_robots.conformance import DeviceSlot, NumberSlot, OptionSlot
+from inspect_robots.conformance import ConformanceIssue, DeviceSlot, NumberSlot, OptionSlot
+
+
+@pytest.fixture(autouse=True)
+def _isolate_host_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep setup output independent of installed plugin distributions."""
+    monkeypatch.setattr("inspect_robots._doctor_probes._version_probe", lambda: [])
 
 
 def _scripted_input(
@@ -5346,3 +5352,194 @@ def test_render_config_managed_policy_args_missing_from_policy_args() -> None:
 )
 def test_valid_max_steps_accepts_a_zero_padded_integer(value: str, valid: bool) -> None:
     assert _valid_max_steps(value) is valid
+
+
+@pytest.mark.parametrize(
+    ("selection", "style"), [("default", "plain"), ("env", "tty"), ("flag", "no-color")]
+)
+def test_run_setup_host_preflight_aggregates_saved_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selection: str, style: str
+) -> None:
+    """All five host checks precede Next, without constructing either component."""
+    import socket
+
+    from inspect_robots import _doctor_probes, cli
+
+    path = _config_path(tmp_path) if selection == "default" else tmp_path / "rig b.ini"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "[defaults]\npolicy = old-policy\nembodiment = old-rig\n"
+        "[policy.args]\nserver_url = http://localhost:8202/act\n"
+        f"[embodiment.args]\nwrist = {tmp_path / 'missing-camera'}\nleft = can_left\n",
+        encoding="utf-8",
+    )
+
+    class _Policy:
+        RUNTIME_REQUIREMENTS: ClassVar[dict[str, str]] = {
+            "missing_setup_transport": "uv pip install transport"
+        }
+
+        def __init__(self, server_url: str) -> None:
+            raise AssertionError("setup must not construct policies")
+
+    class _Rig:
+        DEVICE_SLOTS: ClassVar[tuple[DeviceSlot, ...]] = (
+            DeviceSlot("wrist", "v4l2", "wrist camera"),
+            DeviceSlot("left", "can", "left CAN"),
+        )
+
+        def __init__(self) -> None:
+            raise AssertionError("setup must not construct embodiments")
+
+    monkeypatch.setattr(
+        "inspect_robots.registry.registered",
+        lambda kind: {"setup-policy": _Policy} if kind == "policy" else {"setup-rig": _Rig},
+    )
+    calls: list[tuple[tuple[str, int], float]] = []
+
+    def refused(address: tuple[str, int], *, timeout: float) -> socket.socket:
+        assert "policy = setup-policy" in path.read_text(encoding="utf-8")
+        calls.append((address, timeout))
+        raise ConnectionRefusedError("offline")
+
+    monkeypatch.setattr(socket, "create_connection", refused)
+    monkeypatch.setattr(_doctor_probes, "_can_inventory", lambda net: {"can_left": False})
+    monkeypatch.setattr(
+        _doctor_probes,
+        "_version_probe",
+        lambda: [
+            ConformanceIssue(
+                "error", "version", "stale plugin; run: uv pip install --upgrade plugin"
+            )
+        ],
+    )
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    if style == "no-color":
+        monkeypatch.setenv("NO_COLOR", "1")
+    env = {
+        "XDG_CONFIG_HOME": str(tmp_path),
+        "INSPECT_ROBOTS_POLICY": "scripted",
+        "INSPECT_ROBOTS_EMBODIMENT": "cubepick",
+    }
+    if selection == "env":
+        env["INSPECT_ROBOTS_CONFIG"] = str(path)
+    input_fn, prompts = _scripted_input(["setup-policy", "setup-rig", "", "", "true", "", "n"])
+    out = io.StringIO() if style == "plain" else _TtyStringIO()
+    if selection == "flag":
+        for key in ("DISPLAY", "WAYLAND_DISPLAY", "INSPECT_ROBOTS_CONFIG"):
+            monkeypatch.delenv(key, raising=False)
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setattr("builtins.input", input_fn)
+        monkeypatch.setattr(sys, "stdout", out)
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        result = cli.main(["setup", "--config", str(path)])
+    else:
+        result = run_setup(
+            env,
+            input_fn=input_fn,
+            out=out,
+            interactive=True,
+            by_id_dir=tmp_path / "no-cameras",
+            by_path_dir=tmp_path / "no-ports",
+            sysfs_net=tmp_path / "no-can",
+        )
+    text = out.getvalue()
+    assert result == 0
+    assert len(prompts) == 7
+    assert calls == [(("localhost", 8202), 1.0)]
+    assert text.count("host preflight findings:") == 1
+    findings = text.split("host preflight findings:\n", 1)[1].split("Next: ", 1)[0]
+    assert len(findings.strip().splitlines()) == 5
+    for expected in (
+        "[error] version: stale plugin; run: uv pip install --upgrade plugin",
+        "[warning] display: Rerun viewer enabled without a display",
+        "inspect-robots config set rerun false",
+        "[error] policy-server:",
+        "nc -vz -w 1 localhost 8202",
+        "wrist camera (wrist): v4l2 path",
+        "inspect-robots setup",
+        "sudo ip link set dev can_left up",
+    ):
+        assert expected in findings
+    assert text.index("Wrote ") < text.index("runtime dependency is missing:")
+    assert text.index("runtime dependency is missing:") < text.index("host preflight findings:")
+    assert text.index("host preflight findings:") < text.index("Next: ")
+    if style == "tty":
+        assert "\x1b[33mhost preflight findings:" in text
+    else:
+        assert "\x1b[" not in text
+    assert "\x1b[" not in path.read_text(encoding="utf-8")
+    if selection != "default":
+        assert "--config '" + str(path) + "'" in findings
+
+
+def test_run_setup_host_preflight_clean_is_silent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clean host adds no checklist or success banner after the saved config."""
+    calls: list[bool] = []
+
+    def versions() -> list[ConformanceIssue]:
+        calls.append(_config_path(tmp_path).is_file())
+        return []
+
+    monkeypatch.setattr("inspect_robots._doctor_probes._version_probe", versions)
+    monkeypatch.setattr(
+        "inspect_robots.registry.registered",
+        lambda kind: {"scripted": object()} if kind == "policy" else {"cubepick": object()},
+    )
+    input_fn, _ = _scripted_input(["scripted", "cubepick", "", "", "false", "", "n"])
+    out = io.StringIO()
+    assert (
+        run_setup(
+            {"XDG_CONFIG_HOME": str(tmp_path)},
+            input_fn=input_fn,
+            out=out,
+            interactive=True,
+            by_id_dir=tmp_path / "none-id",
+            by_path_dir=tmp_path / "none-path",
+        )
+        == 0
+    )
+    assert calls == [True]
+    assert out.getvalue().split(f"Wrote {_config_path(tmp_path)}\n")[1] == (
+        'Next: inspect-robots "place the fork on the plate"\n'
+    )
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("unreadable metadata"), SystemExit("bad config")])
+def test_run_setup_host_preflight_failure_keeps_written_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: BaseException
+) -> None:
+    """Unexpected probe or config-load failures leave successful setup advisory."""
+    calls: list[bool] = []
+
+    def broken_probe() -> list[ConformanceIssue]:
+        calls.append(_config_path(tmp_path).is_file())
+        raise failure
+
+    monkeypatch.setattr("inspect_robots._doctor_probes._version_probe", broken_probe)
+    input_fn, _ = _scripted_input(["scripted", "cubepick", "", "", "false", "", "n"])
+    out = io.StringIO()
+    assert (
+        run_setup(
+            {"XDG_CONFIG_HOME": str(tmp_path)},
+            input_fn=input_fn,
+            out=out,
+            interactive=True,
+            by_id_dir=tmp_path / "none-id",
+            by_path_dir=tmp_path / "none-path",
+        )
+        == 0
+    )
+    assert calls == [True]
+    assert _config_path(tmp_path).is_file()
+    text = out.getvalue()
+    assert "host preflight could not complete; run: inspect-robots doctor --config " in text
+    assert (
+        text.index("Wrote ")
+        < text.index("host preflight could not complete;")
+        < text.index("Next: ")
+    )

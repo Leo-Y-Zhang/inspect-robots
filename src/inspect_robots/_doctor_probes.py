@@ -1,4 +1,4 @@
-"""Read-only host probes for doctor; no component construction or device opens."""
+"""Read-only host probes for doctor and setup; no construction or device opens."""
 
 from __future__ import annotations
 
@@ -69,6 +69,26 @@ def _display_probe(enabled: bool, env: Mapping[str, str], platform: str) -> list
             )
         ]
     return []
+
+
+def _host_probes(
+    policy_factory: object,
+    policy_args: Mapping[str, object],
+    *,
+    rerun: bool,
+    env: Mapping[str, str],
+    platform: str,
+) -> list[ConformanceIssue]:
+    """Collect the host-wide and policy checks shared by doctor and setup.
+
+    Device-slot checks remain a separate phase so doctor can apply its
+    embodiment overrides before checking devices and constructing the adapter.
+    """
+    return (
+        _version_probe()
+        + _display_probe(rerun, env, platform)
+        + _policy_server_probe(policy_factory, policy_args)
+    )
 
 
 def _version_probe(

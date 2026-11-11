@@ -3037,10 +3037,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     """
     from inspect_robots._doctor_probes import (
         _device_probe,
-        _display_probe,
+        _host_probes,
         _install_hint,
-        _policy_server_probe,
-        _version_probe,
     )
     from inspect_robots.conformance import (
         check_embodiment,
@@ -3050,17 +3048,23 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
     defaults = load_defaults(os.environ)
     preflight_failed = False
-    host_issues = _version_probe() + _display_probe(defaults.rerun, os.environ, sys.platform)
+    policy_kvs = (
+        _config_args("policy", defaults.policy, defaults.policy_args_owner, defaults.policy_args)
+        if defaults.policy
+        else {}
+    )
+    host_issues = _host_probes(
+        registered("policy").get(defaults.policy or ""),
+        policy_kvs,
+        rerun=defaults.rerun,
+        env=os.environ,
+        platform=sys.platform,
+    )
     for key, kind, component, component_source in _doctor_configured_components(defaults):
         suffix = f" (from {component_source})" if component_source else ""
         print(f"{key}: {component}{suffix}")
         factories = registered(kind)
         component_factory = factories.get(component)
-        if key == "policy":
-            policy_kvs = _config_args(
-                "policy", component, defaults.policy_args_owner, defaults.policy_args
-            )
-            host_issues.extend(_policy_server_probe(component_factory, policy_kvs))
         if component_factory is None:
             # Keep this wording aligned with registry.resolve so
             # doctor and run commands report unresolved names

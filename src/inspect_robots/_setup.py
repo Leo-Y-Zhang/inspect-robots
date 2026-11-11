@@ -6,6 +6,7 @@ import configparser
 import math
 import os
 import re
+import shlex
 import struct
 import sys
 from collections import Counter
@@ -202,6 +203,45 @@ def _runtime_requirement_lines(defaults: Mapping[str, str]) -> list[str]:
         for module, remedy in missing_runtime_requirements(factories[name]).items():
             lines.append(f"  ✗ {module} ({name}) → {remedy}")
     return lines
+
+
+def _host_preflight_lines(path: Path, env: Mapping[str, str], sysfs_net: Path) -> list[str]:
+    """Report read-only checks of the saved config without failing setup."""
+    from inspect_robots._doctor_probes import _device_probe, _host_probes
+    from inspect_robots.defaults import load_defaults
+    from inspect_robots.registry import registered
+
+    try:
+        # Check what the wizard wrote, even when component env overrides
+        # select something else for a subsequent run.
+        saved = load_defaults({"INSPECT_ROBOTS_CONFIG": str(path)})
+        findings = _host_probes(
+            registered("policy").get(saved.policy or ""),
+            saved.policy_args,
+            rerun=saved.rerun,
+            env=env,
+            platform=sys.platform,
+        )
+        findings.extend(
+            _device_probe(
+                registered("embodiment").get(saved.embodiment or ""),
+                saved.embodiment_args,
+                net=sysfs_net,
+                platform=sys.platform,
+            )
+        )
+    except (Exception, SystemExit):
+        # A diagnostic failure must not turn a completed write into failure.
+        return [
+            "host preflight could not complete; run: "
+            f"inspect-robots doctor --config {shlex.quote(str(path))}"
+        ]
+    if not findings:
+        return []
+    return [
+        "host preflight findings:",
+        *(f"  ✗ [{issue.severity}] {issue.code}: {issue.message}" for issue in findings),
+    ]
 
 
 def _prompt_defaults(
@@ -1574,7 +1614,11 @@ def run_setup(
     sysfs_net: Path = SYSFS_NET,
     serial_by_id_dir: Path = SERIAL_BY_ID,
 ) -> int:
-    """Drive the interactive setup wizard and return its process exit code."""
+    """Write interactive defaults and report advisory runtime and host findings.
+
+    A completed config write returns 0 even when host checks find problems
+    or cannot complete. An aborted interview writes nothing and returns 1.
+    """
     if not interactive:
         raise SystemExit("setup is interactive; see the README for manual config")
 
@@ -1783,6 +1827,9 @@ def run_setup(
             [f"setup complete, but {count} runtime {dependency} missing:", *runtime_lines]
         )
         print(_paint(block, _YELLOW, out), file=out)
+    host_lines = _host_preflight_lines(path, env, sysfs_net)
+    if host_lines:
+        print(_paint("\n".join(host_lines), _YELLOW, out), file=out)
     next_cmd = 'inspect-robots "place the fork on the plate"'
     print(f"Next: {_paint(next_cmd, _CYAN, out)}", file=out)
     return 0

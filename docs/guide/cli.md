@@ -360,7 +360,17 @@ override the suggestion at the prompt.
 
 After writing the config, setup lists missing runtime requirements declared by
 the selected registered policy and embodiment, together with their remediation
-commands.
+commands. It then runs the same read-only host probes as `doctor` against the
+saved configuration: plugin version compatibility, local display availability,
+SocketCAN interfaces, camera/serial paths, and policy-server reachability.
+Findings appear in one yellow block before `Next:`, one line per finding with
+its fix or diagnostic command. Clean host checks add no output.
+
+These probes never construct components, open devices, or energise hardware.
+Policy-server checks use a one-second TCP connection timeout and send no
+application requests. Findings and unexpected check failures are advisory:
+the written config is kept and setup still exits 0. The checks use the file
+selected by `--config` or `INSPECT_ROBOTS_CONFIG` when provided.
 
 Prefer to write the file yourself? This is the wizard's output for a YAM
 rig; replace the three camera paths with your rig's V4L2 color nodes
